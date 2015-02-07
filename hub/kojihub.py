@@ -9332,6 +9332,18 @@ class RootExports(object):
                                values=locals(), opts=queryOpts)
         return query.iterate()
 
+    def reportPackagesByUser(self):
+        '''Report of packages by user
+
+        Return a mapping from user.id to the number of packages
+        '''
+        fields = ('user_id', 'packages_count')
+        sql = '''
+SELECT owner, COUNT(package_id) FROM tag_packages
+GROUP BY owner ORDER BY owner'''
+        rows = _multiRow(sql, None, fields)
+        return dict(((str(row['user_id']), row['packages_count']) for row in rows))
+
 
 class BuildRoot(object):
 

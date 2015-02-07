@@ -1919,13 +1919,10 @@ def packagesbyuser(environ, start=None, order=None):
 
     maxPackages = 1
     users = server.listUsers()
+    data = server.reportPackagesByUser()
 
-    server.multicall = True
     for user in users:
-        server.count('listPackages', userID=user['id'], with_dups=True)
-    packageCounts = server.multiCall()
-
-    for user, [numPackages] in zip(users, packageCounts):
+        numPackages = data.get(str(user['id']), 0)
         user['packages'] = numPackages
         if numPackages > maxPackages:
             maxPackages = numPackages
