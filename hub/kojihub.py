@@ -55,6 +55,8 @@ import types
 import xmlrpclib
 import zipfile
 from koji.context import context
+from koji import db
+
 
 logger = logging.getLogger('koji.hub')
 
@@ -100,7 +102,7 @@ class Task(object):
         #getting a row lock on this task to ensure task assignment sanity
         #no other concurrent transaction should be altering this row
         q = """SELECT state,host_id FROM task WHERE id=%(task_id)s FOR UPDATE"""
-        r = _fetchSingle(q, locals())
+        r = db.fetchSingle(q, locals())
         if not r:
             raise koji.GenericError, "No such task: %i" % task_id
         state, otherhost = r
@@ -113,7 +115,7 @@ class Task(object):
     def getOwner(self):
         """Return the owner (user_id) for this task"""
         q = """SELECT owner FROM task WHERE id=%(id)i"""
-        return _singleValue(q, vars(self))
+        return db.singleValue(q, vars(self))
 
     def verifyOwner(self,user_id=None):
         """Verify that user owns task"""
@@ -124,7 +126,7 @@ class Task(object):
         task_id = self.id
         #getting a row lock on this task to ensure task state sanity
         q = """SELECT owner FROM task WHERE id=%(task_id)s FOR UPDATE"""
-        r = _fetchSingle(q, locals())
+        r = db.fetchSingle(q, locals())
         if not r:
             raise koji.GenericError, "No such task: %i" % task_id
         (owner,) = r
@@ -146,7 +148,7 @@ class Task(object):
         task_id = self.id
         if not force:
             q = """SELECT state,host_id FROM task WHERE id=%(task_id)i FOR UPDATE"""
-            r = _fetchSingle(q,locals())
+            r = db.fetchSingle(q,locals())
             if not r:
                 raise koji.GenericError, "No such task: %i" % task_id
             state, otherhost = r
@@ -214,7 +216,7 @@ class Task(object):
         task_id = self.id
         # access checks should be performed by calling function
         query = """SELECT state FROM task WHERE id = %(id)i FOR UPDATE"""
-        row = _fetchSingle(query,vars(self))
+        row = db.fetchSingle(query,vars(self))
         if not row:
             raise koji.GenericError, "No such task: %i" % self.id
         oldstate = row[0]
@@ -225,7 +227,7 @@ class Task(object):
         newhost = None
         q = """UPDATE task SET state=%(newstate)s,host_id=%(newhost)s
         WHERE id=%(task_id)s"""
-        _dml(q,locals())
+        db.dml(q, locals(), commit=False)
         self.runCallbacks('postTaskStateChange', info, 'state', koji.TASK_STATES['FREE'])
         self.runCallbacks('postTaskStateChange', info, 'host_id', None)
         return True
@@ -238,7 +240,7 @@ class Task(object):
         self.runCallbacks('preTaskStateChange', info, 'weight', weight)
         # access checks should be performed by calling function
         q = """UPDATE task SET weight=%(weight)s WHERE id = %(task_id)s"""
-        _dml(q,locals())
+        db.dml(q, locals(), commit=False)
         self.runCallbacks('postTaskStateChange', info, 'weight', weight)
 
     def setPriority(self, priority, recurse=False):
@@ -249,13 +251,13 @@ class Task(object):
         self.runCallbacks('preTaskStateChange', info, 'priority', priority)
         # access checks should be performed by calling function
         q = """UPDATE task SET priority=%(priority)s WHERE id = %(task_id)s"""
-        _dml(q,locals())
+        db.dml(q, locals(), commit=False)
         self.runCallbacks('postTaskStateChange', info, 'priority', priority)
 
         if recurse:
             """Change priority of child tasks"""
             q = """SELECT id FROM task WHERE parent = %(task_id)s"""
-            for (child_id,) in _fetchMulti(q, locals()):
+            for (child_id,) in db.fetchMulti(q, locals()):
                 Task(child_id).setPriority(priority, recurse=True)
 
     def _close(self,result,state):
@@ -275,7 +277,7 @@ class Task(object):
         WHERE id = %(task_id)d
         """
         # get the result from the info dict, so callbacks have a chance to modify it
-        _dml(update, {'result': info['result'], 'state': state, 'task_id': task_id})
+        db.dml(update, {'result': info['result'], 'state': state, 'task_id': task_id}, commit=False)
         self.runCallbacks('postTaskStateChange', info, 'state', state)
         self.runCallbacks('postTaskStateChange', info, 'completion_ts', now)
 
@@ -289,7 +291,7 @@ class Task(object):
 
     def getState(self):
         query = """SELECT state FROM task WHERE id = %(id)i"""
-        return _singleValue(query, vars(self))
+        return db.singleValue(query, vars(self))
 
     def isFinished(self):
         return (koji.TASK_STATES[self.getState()] in ['CLOSED','CANCELED','FAILED'])
@@ -314,7 +316,7 @@ class Task(object):
         self.runCallbacks('preTaskStateChange', info, 'completion_ts', now)
         task_id = self.id
         q = """SELECT state FROM task WHERE id = %(task_id)s FOR UPDATE"""
-        state = _singleValue(q,locals())
+        state = db.singleValue(q,locals())
         st_canceled = koji.TASK_STATES['CANCELED']
         st_closed = koji.TASK_STATES['CLOSED']
         st_failed = koji.TASK_STATES['FAILED']
@@ -324,7 +326,7 @@ class Task(object):
             return False
         update = """UPDATE task SET state = %(st_canceled)i, completion_time = NOW()
         WHERE id = %(task_id)i"""
-        _dml(update, locals())
+        db.dml(update, locals(), commit=False)
         self.runCallbacks('postTaskStateChange', info, 'state', koji.TASK_STATES['CANCELED'])
         self.runCallbacks('postTaskStateChange', info, 'completion_ts', now)
         #cancel associated builds (only if state is 'BUILDING')
@@ -333,7 +335,7 @@ class Task(object):
         q = """SELECT id FROM build WHERE task_id = %(task_id)i
         AND state = %(b_building)i
         FOR UPDATE"""
-        for (build_id,) in _fetchMulti(q, locals()):
+        for (build_id,) in db.fetchMulti(q, locals()):
             cancel_build(build_id, cancel_task=False)
         if recurse:
             #also cancel child tasks
@@ -344,7 +346,7 @@ class Task(object):
         """Cancel child tasks"""
         task_id = self.id
         q = """SELECT id FROM task WHERE parent = %(task_id)i"""
-        for (id,) in _fetchMulti(q,locals()):
+        for (id,) in db.fetchMulti(q,locals()):
             Task(id).cancel(recurse=True)
 
     def cancelFull(self,strict=True):
@@ -355,7 +357,7 @@ class Task(object):
         """
         task_id = self.id
         q = """SELECT parent FROM task WHERE id = %(task_id)i FOR UPDATE"""
-        parent = _singleValue(q,locals())
+        parent = db.singleValue(q,locals())
         if parent is not None:
             if strict:
                 raise koji.GenericError, "Task %d is not top-level (parent=%d)" % (task_id,parent)
@@ -366,7 +368,7 @@ class Task(object):
                     raise koji.GenericError, "Task LOOP at task %i" % task_id
                 task_id = parent
                 seen[task_id] = 1
-                parent = _singleValue(q,locals())
+                parent = db.singleValue(q,locals())
             return Task(task_id).cancelFull(strict=True)
         #We handle the recursion ourselves, since self.cancel will stop at
         #canceled or closed tasks.
@@ -380,13 +382,13 @@ class Task(object):
                 raise koji.GenericError, "Task LOOP at task %i" % task_id
             seen[task_id] = 1
             Task(task_id).cancel(recurse=False)
-            for (child_id,) in _fetchMulti(q_children,locals()):
+            for (child_id,) in db.fetchMulti(q_children,locals()):
                 tasklist.append(child_id)
 
     def getRequest(self):
         id = self.id
         query = """SELECT request FROM task WHERE id = %(id)i"""
-        xml_request = _singleValue(query, locals())
+        xml_request = db.singleValue(query, locals())
         if xml_request.find('<?xml', 0, 10) == -1:
             #handle older base64 encoded data
             xml_request = base64.decodestring(xml_request)
@@ -395,7 +397,7 @@ class Task(object):
 
     def getResult(self):
         query = """SELECT state,result FROM task WHERE id = %(id)i"""
-        r = _fetchSingle(query, vars(self))
+        r = db.fetchSingle(query, vars(self))
         if not r:
             raise koji.GenericError, "No such task"
         state, xml_result = r
@@ -420,7 +422,7 @@ class Task(object):
         """Return information about the task in a dictionary.  If "request" is True,
         the request will be decoded and included in the dictionary."""
         q = """SELECT %s FROM task WHERE id = %%(id)i""" % ','.join([f[0] for f in self.fields])
-        result = _singleRow(q, vars(self), [f[1] for f in self.fields], strict)
+        result = db.singleRow(q, vars(self), [f[1] for f in self.fields], strict)
         if request:
             result['request'] = self.getRequest()
         return result
@@ -432,7 +434,7 @@ class Task(object):
         if request:
             fields = fields + (('request', 'request'),)
         query = """SELECT %s FROM task WHERE parent = %%(id)i""" % ', '.join([f[0] for f in fields])
-        results = _multiRow(query, vars(self), [f[1] for f in fields])
+        results = db.multiRow(query, vars(self), [f[1] for f in fields])
         if request:
             for task in results:
                 if task['request'].find('<?xml', 0, 10) == -1:
@@ -477,7 +479,7 @@ def make_task(method,arglist,**opts):
         # for subtasks, we use some of the parent's options as defaults
         fields = ('state','owner','channel_id','priority','arch')
         q = """SELECT %s FROM task WHERE id = %%(parent)i""" % ','.join(fields)
-        r = _fetchSingle(q,opts)
+        r = db.fetchSingle(q,opts)
         if not r:
             raise koji.GenericError, "Invalid parent task: %(parent)s" % opts
         pdata = dict(zip(fields,r))
@@ -562,7 +564,7 @@ def make_task(method,arglist,**opts):
         idata['host_id'] = opts['assign']
     insert = InsertProcessor('task', data=idata)
     insert.execute()
-    task_id = _singleValue("SELECT currval('task_id_seq')", strict=True)
+    task_id = db.singleValue("SELECT currval('task_id_seq')", strict=True)
     opts['id'] = task_id
     koji.plugin.run_callbacks('postTaskStateChange', attribute='state', old=None, new='FREE', info=opts)
     return task_id
@@ -593,43 +595,38 @@ def eventCondition(event, table=None):
         raise koji.GenericError, "Invalid event: %r" % event
 
 def readGlobalInheritance(event=None):
-    c=context.cnx.cursor()
-    fields = ('tag_id','parent_id','name','priority','maxdepth','intransitive',
-                'noconfig','pkg_filter')
+    fields = ('tag_id', 'parent_id', 'name', 'priority', 'maxdepth',
+              'intransitive',  'noconfig', 'pkg_filter')
     q="""SELECT %s FROM tag_inheritance JOIN tag ON parent_id = id
     WHERE %s
     ORDER BY priority
     """ % (",".join(fields), eventCondition(event))
-    c.execute(q,locals())
-    #convert list of lists into a list of dictionaries
-    return [ dict(zip(fields,x)) for x in c.fetchall() ]
+    return db.multiRow(q, locals(), fields)
 
 def readInheritanceData(tag_id,event=None):
-    c=context.cnx.cursor()
-    fields = ('parent_id','name','priority','maxdepth','intransitive','noconfig','pkg_filter')
+    fields = ('parent_id', 'name', 'priority', 'maxdepth', 'intransitive',
+              'noconfig', 'pkg_filter')
     q="""SELECT %s FROM tag_inheritance JOIN tag ON parent_id = id
     WHERE %s AND tag_id = %%(tag_id)i
     ORDER BY priority
     """ % (",".join(fields), eventCondition(event))
-    c.execute(q,locals())
-    #convert list of lists into a list of dictionaries
-    data = [ dict(zip(fields,x)) for x in c.fetchall() ]
+    data = db.multiRow(q, locals(), fields)
     # include the current tag_id as child_id, so we can retrace the inheritance chain later
+    # TODO: this loop can be optimized by putting '%d as child_id' into SELECT
+    # clause.
     for datum in data:
         datum['child_id'] = tag_id
     return data
 
 def readDescendantsData(tag_id,event=None):
-    c=context.cnx.cursor()
-    fields = ('tag_id','parent_id','name','priority','maxdepth','intransitive','noconfig','pkg_filter')
-    q="""SELECT %s FROM tag_inheritance JOIN tag ON tag_id = id
+    fields = ('tag_id', 'parent_id', 'name', 'priority', 'maxdepth',
+              'intransitive', 'noconfig', 'pkg_filter')
+    q = """SELECT %s FROM tag_inheritance JOIN tag ON tag_id = id
     WHERE %s AND parent_id = %%(tag_id)i
     ORDER BY priority
     """ % (",".join(fields), eventCondition(event))
-    c.execute(q,locals())
     #convert list of lists into a list of dictionaries
-    data = [ dict(zip(fields,x)) for x in c.fetchall() ]
-    return data
+    return db.multiRow(q, locals(), fields)
 
 def writeInheritanceData(tag_id, changes, clear=False):
     """Add or change inheritance data for a tag"""
@@ -1012,7 +1009,7 @@ def readPackageList(tagID=None, userID=None, pkgID=None, event=None, inherit=Fal
             AND package.name = %%(pkgID)s"""
 
     q = q % locals()
-    for p in _multiRow(q, locals(), [pair[1] for pair in fields]):
+    for p in db.multiRow(q, locals(), [pair[1] for pair in fields]):
         # things are simpler for the first tag
         pkgid = p['package_id']
         if with_dups:
@@ -1038,7 +1035,7 @@ def readPackageList(tagID=None, userID=None, pkgID=None, event=None, inherit=Fal
                 re_cache[pat] = prog
             re_list.append(prog)
         # same query as before, with different params
-        for p in _multiRow(q, locals(), [pair[1] for pair in fields]):
+        for p in db.multiRow(q, locals(), [pair[1] for pair in fields]):
             pkgid = p['package_id']
             if not with_dups and packages.has_key(pkgid):
                 #previous data supercedes
@@ -1196,7 +1193,7 @@ def readTaggedBuilds(tag,event=None,inherit=False,latest=False,package=None,owne
     seen = {}   # used to enforce the 'latest' option
     for tagid in taglist:
         #log_error(koji.db._quoteparams(q,locals()))
-        for build in _multiRow(q, locals(), [pair[1] for pair in fields]):
+        for build in db.multiRow(q, locals(), [pair[1] for pair in fields]):
             pkgid = build['package_id']
             pinfo = packages.get(pkgid,None)
             if pinfo is None or pinfo['blocked']:
@@ -1845,7 +1842,7 @@ def get_tag_groups(tag,event=None,inherit=True,incl_pkgs=True,incl_reqs=True):
     """ % (",".join(fields),evcondition)
     groups = {}
     for tagid in taglist:
-        for group in _multiRow(q,locals(),fields):
+        for group in db.multiRow(q,locals(),fields):
             grp_id = group['group_id']
             # we only take the first entry for group as we go through inheritance
             groups.setdefault(grp_id,group)
@@ -1859,7 +1856,7 @@ def get_tag_groups(tag,event=None,inherit=True,incl_pkgs=True,incl_reqs=True):
         WHERE %s AND tag_id = %%(tagid)s
         """ % (",".join(fields),evcondition)
         for tagid in taglist:
-            for grp_pkg in _multiRow(q,locals(),fields):
+            for grp_pkg in db.multiRow(q,locals(),fields):
                 grp_id = grp_pkg['group_id']
                 if not groups.has_key(grp_id):
                     #tag does not have this group
@@ -1880,7 +1877,7 @@ def get_tag_groups(tag,event=None,inherit=True,incl_pkgs=True,incl_reqs=True):
         WHERE %s AND tag_id = %%(tagid)s
         """ % (",".join(fields),evcondition)
         for tagid in taglist:
-            for grp_req in _multiRow(q,locals(),fields):
+            for grp_req in db.multiRow(q,locals(),fields):
                 grp_id = grp_req['group_id']
                 if not groups.has_key(grp_id):
                     #tag does not have this group
@@ -1921,9 +1918,8 @@ def set_host_enabled(hostname, enabled=True):
     context.session.assertPerm('admin')
     if not get_host(hostname):
         raise koji.GenericError, 'host does not exist: %s' % hostname
-    c = context.cnx.cursor()
-    c.execute("""UPDATE host SET enabled = %(enabled)s WHERE name = %(hostname)s""", locals())
-    context.commit_pending = True
+    sql = 'UPDATE host SET enabled = %(enabled)s WHERE name = %(hostname)s'
+    db.dml(sql, locals(), commit=False)
 
 def add_host_to_channel(hostname, channel_name, create=False):
     """Add the host to the specified channel
@@ -1963,9 +1959,8 @@ def remove_host_from_channel(hostname, channel_name):
             break
     if not found:
         raise koji.GenericError, 'host %s is not subscribed to the %s channel' % (hostname, channel_name)
-    c = context.cnx.cursor()
-    c.execute("""DELETE FROM host_channels WHERE host_id = %(host_id)d and channel_id = %(channel_id)d""", locals())
-    context.commit_pending = True
+    sql = 'DELETE FROM host_channels WHERE host_id = %(host_id)d and channel_id = %(channel_id)d'
+    db.dml(sql, locals(), commit=False)
 
 def rename_channel(old, new):
     """Rename a channel"""
@@ -2000,9 +1995,9 @@ def remove_channel(channel_name, force=False):
         if not force:
             raise koji.GenericError, 'channel %s has host references' % channel_name
         delete = """DELETE FROM host_channels WHERE channel_id=%(channel_id)i"""
-        _dml(delete, locals())
+        db.dml(delete, locals(), commit=False)
     delete = """DELETE FROM channels WHERE id=%(channel_id)i"""
-    _dml(delete, locals())
+    db.dml(delete, locals(), commit=False)
 
 def get_ready_hosts():
     """Return information about hosts that are ready to build.
@@ -2011,7 +2006,6 @@ def get_ready_hosts():
     Note: We ignore hosts that are late checking in (even if a host
         is busy with tasks, it should be checking in quite often).
     """
-    c = context.cnx.cursor()
     fields = ('host.id','name','arches','task_load', 'capacity')
     aliases = ('id','name','arches','task_load', 'capacity')
     q = """
@@ -2023,18 +2017,17 @@ def get_ready_hosts():
         AND update_time > NOW() - '5 minutes'::interval
     """ % ','.join(fields)
     # XXX - magic number in query
-    c.execute(q)
-    hosts = [dict(zip(aliases,row)) for row in c.fetchall()]
+    hosts = db.multiRow(q, None, aliases)
+    fetchMulti = db.fetchMulti
     for host in hosts:
         q = """SELECT channel_id FROM host_channels WHERE host_id=%(id)s"""
-        c.execute(q,host)
-        host['channels'] = [row[0] for row in c.fetchall()]
+        host['channels'] = [row[0] for row in fetchMulti(q, host)]
     return hosts
 
 def get_all_arches():
     """Return a list of all (canonical) arches available from hosts"""
     ret = {}
-    for (arches,) in _fetchMulti('SELECT arches FROM host', {}):
+    for (arches,) in db.fetchMulti('SELECT arches FROM host', {}):
         if arches is None:
             continue
         for arch in arches.split():
@@ -2184,13 +2177,13 @@ def repo_init(tag, with_src=False, with_debuginfo=False, event=None):
             if arch in ['src','noarch']:
                 continue
             repo_arches[arch] = 1
-    repo_id = _singleValue("SELECT nextval('repo_id_seq')")
+    repo_id = db.get_sequence_nextval('repo_id_seq')
     if event is None:
-        event_id = _singleValue("SELECT get_event()")
+        event_id = db.singleValue("SELECT get_event()")
     else:
         #make sure event is valid
         q = "SELECT time FROM events WHERE id=%(event)s"
-        event_time = _singleValue(q, locals(), strict=True)
+        event_time = db.singleValue(q, locals(), strict=True)
         event_id = event
     insert = InsertProcessor('repo')
     insert.set(id=repo_id, create_event=event_id, tag_id=tag_id, state=state)
@@ -2329,12 +2322,12 @@ def repo_set_state(repo_id, state, check=True):
     if check:
         # The repo states are sequential, going backwards makes no sense
         q = """SELECT state FROM repo WHERE id = %(repo_id)s FOR UPDATE"""
-        oldstate = _singleValue(q,locals())
+        oldstate = db.singleValue(q,locals())
         if oldstate > state:
             raise koji.GenericError, "Invalid repo state transition %s->%s" \
                     % (oldstate,state)
     q = """UPDATE repo SET state=%(state)s WHERE id = %(repo_id)s"""
-    _dml(q,locals())
+    db.dml(q, locals(), commit=False)
 
 def repo_info(repo_id, strict=False):
     fields = (
@@ -2350,7 +2343,7 @@ def repo_info(repo_id, strict=False):
     JOIN tag ON tag_id=tag.id
     JOIN events ON repo.create_event = events.id
     WHERE repo.id = %%(repo_id)s""" % ','.join([f[0] for f in fields])
-    return _singleRow(q, locals(), [f[1] for f in fields], strict=strict)
+    return db.singleRow(q, locals(), [f[1] for f in fields], strict=strict)
 
 def repo_ready(repo_id):
     """Set repo state to ready"""
@@ -2384,7 +2377,7 @@ def repo_expire_older(tag_id, event_id):
     WHERE tag_id = %(tag_id)i
         AND create_event < %(event_id)i
         AND state = %(st_ready)i"""
-    _dml(q, locals())
+    db.dml(q, locals(), commit=False)
 
 def repo_references(repo_id):
     """Return a list of buildroots that reference the repo"""
@@ -2393,7 +2386,7 @@ def repo_references(repo_id):
     AND retire_event IS NULL""" % ','.join(fields)
     #check results for bad states
     ret = []
-    for data in _multiRow(q, locals(), fields):
+    for data in db.multiRow(q, locals(), fields):
         if data['state'] == koji.BR_STATES['EXPIRED']:
             log_error("Error: buildroot %(id)s expired, but has no retire_event" % data)
             continue
@@ -2418,7 +2411,7 @@ def get_active_repos():
     JOIN tag ON tag_id=tag.id
     JOIN events ON repo.create_event = events.id
     WHERE repo.state != %%(st_deleted)s""" % ','.join([f[0] for f in fields])
-    return _multiRow(q, locals(), [f[1] for f in fields])
+    return db.multiRow(q, locals(), [f[1] for f in fields])
 
 def tag_changed_since_event(event,taglist):
     """Report whether any changes since event affect any of the tags in list
@@ -2526,7 +2519,7 @@ def edit_build_target(buildTargetInfo, name, build_tag, dest_tag):
 
     if target['name'] != name:
         # Allow renaming, for parity with tags
-        id = _singleValue("""SELECT id from build_target where name = %(name)s""",
+        id = db.singleValue("""SELECT id from build_target where name = %(name)s""",
                           locals(), strict=False)
         if id is not None:
             raise koji.GenericError, 'name "%s" is already taken by build target %i' % (name, id)
@@ -2535,7 +2528,7 @@ def edit_build_target(buildTargetInfo, name, build_tag, dest_tag):
         SET name = %(name)s
         WHERE id = %(buildTargetID)i"""
 
-        _dml(rename, locals())
+        db.dml(rename, locals(), commit=False)
 
     update = UpdateProcessor('build_target_config', values=locals(),
                 clauses=["build_target_id = %(buildTargetID)i"])
@@ -2635,16 +2628,16 @@ def lookup_name(table,info,strict=False,create=False):
         q="""SELECT id,name FROM %s WHERE name=%%(info)s""" % table
     else:
         raise koji.GenericError, 'invalid type for id lookup: %s' % type(info)
-    ret = _singleRow(q,locals(),fields,strict=False)
+    ret = db.singleRow(q,locals(),fields,strict=False)
     if ret is None:
         if strict:
             raise koji.GenericError, 'No such entry in table %s: %s' % (table, info)
         elif create:
             if not isinstance(info, str):
                 raise koji.GenericError, 'Name must be a string'
-            id = _singleValue("SELECT nextval('%s_id_seq')" % table, strict=True)
+            id = db.get_sequence_nextval('%s_id_seq' % table)
             q = """INSERT INTO %s(id,name) VALUES (%%(id)i,%%(info)s)""" % table
-            _dml(q,locals())
+            db.dml(q,locals(), commit=False)
             return {'id': id, 'name': info}
         else:
             return ret
@@ -2838,14 +2831,14 @@ def edit_tag(tagInfo, **kwargs):
             'tagID': tag['id']
             }
         q = """SELECT id FROM tag WHERE name=%(name)s"""
-        id = _singleValue(q,values,strict=False)
+        id = db.singleValue(q,values,strict=False)
         if id is not None:
             #new name is taken
             raise koji.GenericError, "Name %s already taken by tag %s" % (name,id)
         update = """UPDATE tag
         SET name = %(name)s
         WHERE id = %(tagID)i"""
-        _dml(update, values)
+        db.dml(update, values, commit=False)
 
     #check for changes
     data = tag.copy()
@@ -2979,13 +2972,13 @@ def edit_external_repo(info, name=None, url=None):
     repo_id = repo['id']
 
     if name and name != repo['name']:
-        existing_id = _singleValue("""SELECT id FROM external_repo WHERE name = %(name)s""",
+        existing_id = db.singleValue("""SELECT id FROM external_repo WHERE name = %(name)s""",
                                    locals(), strict=False)
         if existing_id is not None:
             raise koji.GenericError, 'name "%s" is already taken by external repo %i' % (name, existing_id)
 
         rename = """UPDATE external_repo SET name = %(name)s WHERE id = %(repo_id)i"""
-        _dml(rename, locals())
+        db.dml(rename, locals(), commit=False)
 
     if url and url != repo['url']:
         if not url.endswith('/'):
@@ -3167,7 +3160,7 @@ def get_user(userInfo=None,strict=False):
         q += """ (krb_principal = %(userInfo)s or name = %(userInfo)s)"""
     else:
         raise koji.GenericError, 'invalid type for userInfo: %s' % type(userInfo)
-    return _singleRow(q,locals(),fields,strict=strict)
+    return db.singleRow(q,locals(),fields,strict=strict)
 
 def find_build_id(X):
     if isinstance(X,int) or isinstance(X,long):
@@ -3183,19 +3176,14 @@ def find_build_id(X):
             data.has_key('release')):
         raise koji.GenericError, 'did not provide name, version, and release'
 
-    c=context.cnx.cursor()
     q="""SELECT build.id FROM build JOIN package ON build.pkg_id=package.id
     WHERE package.name=%(name)s AND build.version=%(version)s
     AND build.release=%(release)s
     """
     # contraints should ensure this is unique
     #log_error(koji.db._quoteparams(q,data))
-    c.execute(q,data)
-    r=c.fetchone()
     #log_error("%r" % r )
-    if not r:
-        return None
-    return r[0]
+    return db.singleValue(q, data)
 
 def get_build(buildInfo, strict=False):
     """Return information about a build.  buildID may be either
@@ -3248,9 +3236,7 @@ def get_build(buildInfo, strict=False):
     JOIN users on build.owner = users.id
     WHERE build.id = %%(buildID)i""" % ', '.join([pair[0] for pair in fields])
 
-    c = context.cnx.cursor()
-    c.execute(query, locals())
-    result = c.fetchone()
+    result = db.fetchSingle(query, locals())
 
     if not result:
         if strict:
@@ -3477,7 +3463,7 @@ def get_maven_build(buildInfo, strict=False):
     query = """SELECT %s
     FROM maven_builds
     WHERE build_id = %%(build_id)i""" % ', '.join(fields)
-    return _singleRow(query, locals(), fields, strict)
+    return db.singleRow(query, locals(), fields, strict)
 
 def get_win_build(buildInfo, strict=False):
     """
@@ -3723,7 +3709,7 @@ def get_archive(archive_id, strict=False):
     fields = ('id', 'type_id', 'build_id', 'buildroot_id', 'filename', 'size', 'checksum', 'checksum_type')
     select = """SELECT %s FROM archiveinfo
     WHERE id = %%(archive_id)i""" % ', '.join(fields)
-    archive =  _singleRow(select, locals(), fields, strict=strict)
+    archive = db.singleRow(select, locals(), fields, strict=strict)
     if not archive:
         # strict is taken care of by _singleRow()
         return None
@@ -3755,7 +3741,7 @@ def get_maven_archive(archive_id, strict=False):
     fields = ('archive_id', 'group_id', 'artifact_id', 'version')
     select = """SELECT %s FROM maven_archives
     WHERE archive_id = %%(archive_id)i""" % ', '.join(fields)
-    return _singleRow(select, locals(), fields, strict=strict)
+    return db.singleRow(select, locals(), fields, strict=strict)
 
 def get_win_archive(archive_id, strict=False):
     """
@@ -3770,7 +3756,7 @@ def get_win_archive(archive_id, strict=False):
     fields = ('archive_id', 'relpath', 'platforms', 'flags')
     select = """SELECT %s FROM win_archives
     WHERE archive_id = %%(archive_id)i""" % ', '.join(fields)
-    return _singleRow(select, locals(), fields, strict=strict)
+    return db.singleRow(select, locals(), fields, strict=strict)
 
 def get_image_archive(archive_id, strict=False):
     """
@@ -3784,14 +3770,14 @@ def get_image_archive(archive_id, strict=False):
     fields = ('archive_id', 'arch')
     select = """SELECT %s FROM image_archives
     WHERE archive_id = %%(archive_id)i""" % ', '.join(fields)
-    results = _singleRow(select, locals(), fields, strict=strict)
+    results = db.singleRow(select, locals(), fields, strict=strict)
     if not results:
         return None
     results['rootid'] = False
     fields = ('image_id', 'rpm_id')
     select = """SELECT %s FROM image_listing
     WHERE image_id = %%(archive_id)i""" % ', '.join(fields)
-    rpms = _singleRow(select, locals(), fields, strict=strict)
+    rpms = db.singleRow(select, locals(), fields, strict=strict)
     if rpms:
         results['rootid'] = True
     return results
@@ -3934,80 +3920,6 @@ def list_task_output(taskID, stat=False):
                 result.append(relfilename)
     return result
 
-def _fetchMulti(query, values):
-    """Run the query and return all rows"""
-    c = context.cnx.cursor()
-    c.execute(query, values)
-    results = c.fetchall()
-    c.close()
-    return results
-
-def _fetchSingle(query, values, strict=False):
-    """Run the query and return a single row
-
-    If strict is true, raise an error if the query returns more or less than
-    one row."""
-    results = _fetchMulti(query, values)
-    numRows = len(results)
-    if numRows == 0:
-        if strict:
-            raise koji.GenericError, 'query returned no rows'
-        else:
-            return None
-    elif strict and numRows > 1:
-        raise koji.GenericError, 'multiple rows returned for a single row query'
-    else:
-        return results[0]
-
-def _multiRow(query, values, fields):
-    """Return all rows from "query".  Named query parameters
-    can be specified using the "values" map.  Results will be returned
-    as a list of maps.  Each map in the list will have a key for each
-    element in the "fields" list.  If there are no results, an empty
-    list will be returned."""
-    return [dict(zip(fields, row)) for row in _fetchMulti(query, values)]
-
-def _singleRow(query, values, fields, strict=False):
-    """Return a single row from "query".  Named parameters can be
-    specified using the "values" map.  The result will be returned as
-    as map.  The map will have a key for each element in the "fields"
-    list.  If more than one row is returned and "strict" is true, a
-    GenericError will be raised.  If no rows are returned, and "strict"
-    is True, a GenericError will be raised.  Otherwise None will be
-    returned."""
-    row = _fetchSingle(query, values, strict)
-    if row:
-        return dict(zip(fields, row))
-    else:
-        #strict enforced by _fetchSingle
-        return None
-
-def _singleValue(query, values=None, strict=True):
-    """Perform a query that returns a single value.
-
-    Note that unless strict is True a return value of None could mean either
-    a single NULL value or zero rows returned."""
-    if values is None:
-        values = {}
-    row = _fetchSingle(query, values, strict)
-    if row:
-        if strict and len(row) > 1:
-            raise koji.GenericError, 'multiple fields returned for a single value query'
-        return row[0]
-    else:
-        # don't need to check strict here, since that was already handled by _singleRow()
-        return None
-
-def _dml(operation, values):
-    """Run an insert, update, or delete. Return number of rows affected"""
-    c = context.cnx.cursor()
-    c.execute(operation, values)
-    ret = c.rowcount
-    logger.debug("Operation affected %s row(s)", ret)
-    c.close()
-    context.commit_pending = True
-    return ret
-
 def get_host(hostInfo, strict=False):
     """Get information about the given host.  hostInfo may be
     either a string (hostname) or int (host id).  A map will be returned
@@ -4035,7 +3947,7 @@ def get_host(hostInfo, strict=False):
     else:
         raise koji.GenericError, 'invalid type for hostInfo: %s' % type(hostInfo)
 
-    return _singleRow(query, locals(), fields, strict)
+    return db.singleRow(query, locals(), fields, strict)
 
 def edit_host(hostInfo, **kw):
     """Edit information for an existing host.
@@ -4070,7 +3982,7 @@ def edit_host(hostInfo, **kw):
     update = 'UPDATE host set ' + ', '.join(changes) + ' where id = %(id)i'
     data = kw.copy()
     data['id'] = host['id']
-    _dml(update, data)
+    db.dml(update, data, commit=False)
     return True
 
 def get_channel(channelInfo, strict=False):
@@ -4085,7 +3997,7 @@ def get_channel(channelInfo, strict=False):
     else:
         raise koji.GenericError, 'invalid type for channelInfo: %s' % type(channelInfo)
 
-    return _singleRow(query, locals(), fields, strict)
+    return db.singleRow(query, locals(), fields, strict)
 
 
 def query_buildroots(hostID=None, tagID=None, state=None, rpmID=None, archiveID=None, taskID=None, buildrootID=None, queryOpts=None):
@@ -4173,26 +4085,21 @@ def list_channels(hostID=None):
     if hostID != None:
         query += """JOIN host_channels ON channels.id = host_channels.channel_id
         WHERE host_channels.host_id = %(hostID)i"""
-    return _multiRow(query, locals(), fields)
+    return db.multiRow(query, locals(), fields)
 
 def new_package(name,strict=True):
-    c = context.cnx.cursor()
     # TODO - table lock?
     # check for existing
     q = """SELECT id FROM package WHERE name=%(name)s"""
-    c.execute(q,locals())
-    row = c.fetchone()
+    row = db.fetchSingle(q, locals())
     if row:
         (pkg_id,) = row
         if strict:
             raise koji.GenericError, "Package already exists [id %d]" % pkg_id
     else:
-        q = """SELECT nextval('package_id_seq')"""
-        c.execute(q)
-        (pkg_id,) = c.fetchone()
+        pkg_id = db.get_sequence_nextval('package_id_seq')
         q = """INSERT INTO package (id,name) VALUES (%(pkg_id)s,%(name)s)"""
-        context.commit_pending = True
-        c.execute(q,locals())
+        db.dml(q, locals(), commit=False)
     return pkg_id
 
 
@@ -4218,7 +4125,7 @@ def remove_volume(volume):
     if query.execute():
         raise koji.GenericError, 'volume %(name)s has build references' % volinfo
     delete = """DELETE FROM volume WHERE id=%(id)i"""
-    _dml(delete, volinfo)
+    db.dml(delete, volinfo, commit=False)
 
 def list_volumes():
     """List storage volumes"""
@@ -4330,7 +4237,7 @@ def new_build(data):
     q="""SELECT id,state,task_id FROM build
     WHERE pkg_id=%(pkg_id)d AND version=%(version)s AND release=%(release)s
     FOR UPDATE"""
-    row = _fetchSingle(q, data)
+    row = db.fetchSingle(q, data)
     if row:
         id, state, task_id = row
         data['id'] = id
@@ -4348,7 +4255,7 @@ def new_build(data):
             update = """UPDATE build SET state=%(state)i,task_id=%(task_id)s,
             owner=%(owner)s,completion_time=%(completion_time)s,create_event=get_event()
             WHERE id = %(id)i"""
-            _dml(update, data)
+            db.dml(update, data, commit=False)
             koji.plugin.run_callbacks('postBuildStateChange', attribute='state', old=state, new=data['state'], info=data)
             return id
         raise koji.GenericError, "Build already exists (id=%d, state=%s): %r" \
@@ -4358,7 +4265,7 @@ def new_build(data):
     #insert the new data
     insert_data = dslice(data, ['pkg_id', 'version', 'release', 'epoch', 'state', 'volume_id',
                          'task_id', 'owner', 'completion_time'])
-    data['id'] = insert_data['id'] = _singleValue("SELECT nextval('build_id_seq')")
+    data['id'] = insert_data['id'] = db.get_sequence_nextval('build_id_seq')
     insert = InsertProcessor('build', data=insert_data)
     insert.execute()
     koji.plugin.run_callbacks('postBuildStateChange', attribute='state', old=None, new=data['state'], info=data)
@@ -4449,7 +4356,7 @@ def import_build(srpm, rpms, brmap=None, task_id=None, build_id=None, logs=None)
         #update build state
         update = """UPDATE build SET state=%(st_complete)i,completion_time=NOW()
         WHERE id=%(build_id)i"""
-        _dml(update,locals())
+        db.dml(update, locals(), commit=False)
         koji.plugin.run_callbacks('postBuildStateChange', attribute='state', old=binfo['state'], new=st_complete, info=binfo)
     # now to handle the individual rpms
     for relpath in [srpm] + rpms:
@@ -4522,7 +4429,7 @@ def import_rpm(fn,buildinfo=None,brootid=None,wrapper=False):
                     % (fn,basename,srpmname)
 
     #add rpminfo entry
-    rpminfo['id'] = _singleValue("""SELECT nextval('rpminfo_id_seq')""")
+    rpminfo['id'] = db.get_sequence_nextval('rpminfo_id_seq')
     rpminfo['build_id'] = buildinfo['id']
     rpminfo['size'] = os.path.getsize(fn)
     rpminfo['payloadhash'] = koji.hex_string(hdr[rpm.RPMTAG_SIGMD5])
@@ -4596,7 +4503,7 @@ def add_external_rpm(rpminfo, external_repo, strict=True):
 
     #add rpminfo entry
     rpminfo['external_repo_id'] = get_external_repo_id(external_repo, strict=True)
-    rpminfo['id'] = _singleValue("""SELECT nextval('rpminfo_id_seq')""")
+    rpminfo['id'] = db.get_sequence_nextval('rpminfo_id_seq')
     q = """INSERT INTO rpminfo (id, build_id, buildroot_id,
             name, version, release, epoch, arch,
             external_repo_id,
@@ -4606,7 +4513,7 @@ def add_external_rpm(rpminfo, external_repo, strict=True):
             %(external_repo_id)i,
             %(payloadhash)s, %(size)i, %(buildtime)i)
     """
-    _dml(q, rpminfo)
+    db.dml(q, rpminfo, commit=False)
 
     return get_rpm(rpminfo['id'])
 
@@ -4701,7 +4608,7 @@ def import_build_in_place(build):
     koji.plugin.run_callbacks('preBuildStateChange', attribute='state', old=buildinfo['state'], new=st_complete, info=buildinfo)
     update = """UPDATE build SET state=%(st_complete)i,completion_time=NOW()
     WHERE id=%(build_id)i"""
-    _dml(update,locals())
+    db.dml(update,locals(), commit=False)
     koji.plugin.run_callbacks('postBuildStateChange', attribute='state', old=buildinfo['state'], new=st_complete, info=buildinfo)
     koji.plugin.run_callbacks('postImport', type='build', in_place=True, srpm=srpm, rpms=rpms)
     return build_id
@@ -4726,17 +4633,17 @@ def get_archive_types():
     """Return a list of all supported archivetypes"""
     select = """SELECT id, name, description, extensions FROM archivetypes
     ORDER BY id"""
-    return _multiRow(select, {}, ('id', 'name', 'description', 'extensions'))
+    return db.multiRow(select, {}, ('id', 'name', 'description', 'extensions'))
 
 def _get_archive_type_by_name(name, strict=True):
     select = """SELECT id, name, description, extensions FROM archivetypes
     WHERE name = %(name)s"""
-    return _singleRow(select, locals(), ('id', 'name', 'description', 'extensions'), strict)
+    return db.singleRow(select, locals(), ('id', 'name', 'description', 'extensions'), strict)
 
 def _get_archive_type_by_id(type_id, strict=False):
     select = """SELECT id, name, description, extensions FROM archivetypes
     WHERE id = %(type_id)i"""
-    return _singleRow(select, locals(), ('id', 'name', 'description', 'extensions'), strict)
+    return db.singleRow(select, locals(), ('id', 'name', 'description', 'extensions'), strict)
 
 def get_archive_type(filename=None, type_name=None, type_id=None, strict=False):
     """
@@ -4759,7 +4666,7 @@ def get_archive_type(filename=None, type_name=None, type_id=None, strict=False):
 
         select = r"""SELECT id, name, description, extensions FROM archivetypes
                       WHERE extensions ~ E'\\m%s\\M'""" % ext
-        results = _multiRow(select, locals(), ('id', 'name', 'description', 'extensions'))
+        results = db.multiRow(select, locals(), ('id', 'name', 'description', 'extensions'))
 
         if len(results) == 1:
             return results[0]
@@ -4791,7 +4698,7 @@ def new_maven_build(build, maven_info):
         maven_info['build_id'] = build['id']
         insert = """INSERT INTO maven_builds (build_id, group_id, artifact_id, version)
                     VALUES (%(build_id)i, %(group_id)s, %(artifact_id)s, %(version)s)"""
-        _dml(insert, maven_info)
+        db.dml(insert, maven_info, commit=False)
 
 def new_win_build(build_info, win_info):
     """
@@ -5005,7 +4912,7 @@ def import_archive(filepath, buildinfo, type, typeInfo, buildroot_id=None):
                               build_type=type, filepath=filepath)
 
     # XXX verify that the buildroot is associated with a task that's associated with the build
-    archive_id = _singleValue("SELECT nextval('archiveinfo_id_seq')", strict=True)
+    archive_id = db.get_sequence_nextval('archiveinfo_id_seq')
     archiveinfo['id'] = archive_id
     insert = InsertProcessor('archiveinfo', data=archiveinfo)
     insert.execute()
@@ -5151,7 +5058,7 @@ def add_rpm_sig(an_rpm, sighdr):
     rpm_id = rinfo['id']
     # - db entry
     q = """SELECT sighash FROM rpmsigs WHERE rpm_id=%(rpm_id)i AND sigkey=%(sigkey)s"""
-    rows = _fetchMulti(q, locals())
+    rows = db.fetchMulti(q, locals())
     if rows:
         #TODO[?] - if sighash is the same, handle more gracefully
         nvra = "%(name)s-%(version)s-%(release)s.%(arch)s" % rinfo
@@ -5162,7 +5069,7 @@ def add_rpm_sig(an_rpm, sighdr):
     koji.plugin.run_callbacks('preRPMSign', attribute='sighash', old=None, new=sighash, info=callback_info)
     insert = """INSERT INTO rpmsigs(rpm_id, sigkey, sighash)
     VALUES (%(rpm_id)s, %(sigkey)s, %(sighash)s)"""
-    _dml(insert, locals())
+    db.dml(insert, locals(), commit=False)
     # - write to fs
     sigpath = "%s/%s" % (builddir, koji.pathinfo.sighdr(rinfo, sigkey))
     koji.ensuredir(os.path.dirname(sigpath))
@@ -5270,7 +5177,7 @@ def write_signed_rpm(an_rpm, sigkey, force=False):
     #make sure we have it in the db
     rpm_id = rinfo['id']
     q = """SELECT sighash FROM rpmsigs WHERE rpm_id=%(rpm_id)i AND sigkey=%(sigkey)s"""
-    row = _fetchSingle(q, locals())
+    row = db.fetchSingle(q, locals())
     if not row:
         raise koji.GenericError, "No cached signature for package %s, key %s" % (nvra, sigkey)
     (sighash,) = row
@@ -5636,7 +5543,7 @@ def build_map():
         JOIN build AS used ON used.id = r_used.build_id
         JOIN build AS built ON built.id = r_built.build_id
     WHERE built.state = %(st_complete)i AND used.state =%(st_complete)i"""
-    return _multiRow(q, locals(), fields)
+    return db.multiRow(q, locals(), fields)
 
 def build_references(build_id, limit=None):
     """Returns references to a build
@@ -5655,11 +5562,11 @@ def build_references(build_id, limit=None):
     # find tags
     q = """SELECT tag_id, tag.name FROM tag_listing JOIN tag on tag_id = tag.id
     WHERE build_id = %(build_id)i AND active = TRUE"""
-    ret['tags'] = _multiRow(q, locals(), ('id', 'name'))
+    ret['tags'] = db.multiRow(q, locals(), ('id', 'name'))
 
     #we'll need the component rpm ids for the rest
     q = """SELECT id FROM rpminfo WHERE build_id=%(build_id)i"""
-    rpm_ids = _fetchMulti(q, locals())
+    rpm_ids = db.fetchMulti(q, locals())
 
     # find rpms whose buildroots we were in
     st_complete = koji.BUILD_STATES['COMPLETE']
@@ -5674,7 +5581,7 @@ def build_references(build_id, limit=None):
     if limit is not None:
         q += "\nLIMIT %(limit)i"
     for (rpm_id,) in rpm_ids:
-        for row in _multiRow(q, locals(), fields):
+        for row in db.multiRow(q, locals(), fields):
             idx.setdefault(row['id'], row)
         if limit is not None and len(idx) > limit:
             break
@@ -5682,7 +5589,7 @@ def build_references(build_id, limit=None):
 
     # find archives whose buildroots we were in
     q = """SELECT id FROM archiveinfo WHERE build_id = %(build_id)i"""
-    archive_ids = _fetchMulti(q, locals())
+    archive_ids = db.fetchMulti(q, locals())
     fields = ('id', 'type_id', 'type_name', 'build_id', 'filename')
     idx = {}
     q = """SELECT archiveinfo.id, archiveinfo.type_id, archivetypes.name, archiveinfo.build_id, archiveinfo.filename
@@ -5695,7 +5602,7 @@ def build_references(build_id, limit=None):
     if limit is not None:
         q += "\nLIMIT %(limit)i"
     for (archive_id,) in archive_ids:
-        for row in _multiRow(q, locals(), fields):
+        for row in db.multiRow(q, locals(), fields):
             idx.setdefault(row['id'], row)
         if limit is not None and len(idx) > limit:
             break
@@ -5710,14 +5617,14 @@ def build_references(build_id, limit=None):
     LIMIT 1"""
     event_id = -1
     for (rpm_id,) in rpm_ids:
-        tmp_id = _singleValue(q, locals(), strict=False)
+        tmp_id = db.singleValue(q, locals(), strict=False)
         if tmp_id is not None and tmp_id > event_id:
             event_id = tmp_id
     if event_id == -1:
         ret['last_used'] = None
     else:
         q = """SELECT EXTRACT(EPOCH FROM get_event_time(%(event_id)i))"""
-        ret['last_used'] = _singleValue(q, locals())
+        ret['last_used'] = db.singleValue(q, locals())
 
     q = """SELECT buildroot.create_event
     FROM buildroot_archives
@@ -5727,14 +5634,14 @@ def build_references(build_id, limit=None):
     LIMIT 1"""
     event_id = -1
     for (archive_id,) in archive_ids:
-        tmp_id = _singleValue(q, locals(), strict=False)
+        tmp_id = db.singleValue(q, locals(), strict=False)
         if tmp_id is not None and tmp_id > event_id:
             event_id = tmp_id
     if event_id == -1:
         pass
     else:
         q = """SELECT EXTRACT(EPOCH FROM get_event_time(%(event_id)i))"""
-        last_archive_use = _singleValue(q, locals())
+        last_archive_use = db.singleValue(q, locals())
         if ret['last_used'] is None or last_archive_use > ret['last_used']:
             ret['last_used'] = last_archive_use
 
@@ -5802,15 +5709,15 @@ def _delete_build(binfo):
     koji.plugin.run_callbacks('preBuildStateChange', attribute='state', old=binfo['state'], new=st_deleted, info=binfo)
     build_id = binfo['id']
     q = """SELECT id FROM rpminfo WHERE build_id=%(build_id)i"""
-    rpm_ids = _fetchMulti(q, locals())
+    rpm_ids = db.fetchMulti(q, locals())
     for (rpm_id,) in rpm_ids:
         delete = """DELETE FROM rpmsigs WHERE rpm_id=%(rpm_id)i"""
-        _dml(delete, locals())
+        db.dml(delete, locals(), commit=False)
     update = UpdateProcessor('tag_listing', clauses=["build_id=%(build_id)i"], values=locals())
     update.make_revoke()
     update.execute()
     update = """UPDATE build SET state=%(st_deleted)i WHERE id=%(build_id)i"""
-    _dml(update, locals())
+    db.dml(update, locals(), commit=False)
     #now clear the build dirs
     dirs_to_clear = []
     builddir = koji.pathinfo.build(binfo)
@@ -5849,32 +5756,32 @@ def reset_build(build):
         return
     koji.plugin.run_callbacks('preBuildStateChange', attribute='state', old=binfo['state'], new=koji.BUILD_STATES['CANCELED'], info=binfo)
     q = """SELECT id FROM rpminfo WHERE build_id=%(id)i"""
-    ids = _fetchMulti(q, binfo)
+    ids = db.fetchMulti(q, binfo)
     for (rpm_id,) in ids:
         delete = """DELETE FROM rpmsigs WHERE rpm_id=%(rpm_id)i"""
-        _dml(delete, locals())
+        db.dml(delete, locals(), commit=False)
         delete = """DELETE FROM buildroot_listing WHERE rpm_id=%(rpm_id)i"""
-        _dml(delete, locals())
+        db.dml(delete, locals(), commit=False)
     delete = """DELETE FROM rpminfo WHERE build_id=%(id)i"""
-    _dml(delete, binfo)
+    db.dml(delete, binfo, commit=False)
     q = """SELECT id FROM archiveinfo WHERE build_id=%(id)i"""
-    ids = _fetchMulti(q, binfo)
+    ids = db.fetchMulti(q, binfo)
     for (archive_id,) in ids:
         delete = """DELETE FROM maven_archives WHERE archive_id=%(archive_id)i"""
-        _dml(delete, locals())
+        db.dml(delete, locals(), commit=False)
         delete = """DELETE FROM win_archives WHERE archive_id=%(archive_id)i"""
-        _dml(delete, locals())
+        db.dml(delete, locals(), commit=False)
         delete = """DELETE FROM buildroot_archives WHERE archive_id=%(archive_id)i"""
-        _dml(delete, locals())
+        db.dml(delete, locals(), commit=False)
     delete = """DELETE FROM archiveinfo WHERE build_id=%(id)i"""
-    _dml(delete, binfo)
+    db.dml(delete, binfo, commit=False)
     delete = """DELETE FROM maven_builds WHERE build_id = %(id)i"""
-    _dml(delete, binfo)
+    db.dml(delete, binfo, commit=False)
     delete = """DELETE FROM win_builds WHERE build_id = %(id)i"""
-    _dml(delete, binfo)
+    db.dml(delete, binfo, commit=False)
     binfo['state'] = koji.BUILD_STATES['CANCELED']
     update = """UPDATE build SET state=%(state)i, task_id=NULL WHERE id=%(id)i"""
-    _dml(update, binfo)
+    db.dml(update, binfo, commit=False)
     #now clear the build dirs
     dirs_to_clear = []
     builddir = koji.pathinfo.build(binfo)
@@ -5911,7 +5818,7 @@ def cancel_build(build_id, cancel_task=True):
     update = """UPDATE build
     SET state = %(st_canceled)i, completion_time = NOW()
     WHERE id = %(build_id)i AND state = %(st_building)i"""
-    _dml(update, locals())
+    db.dml(update, locals(), commit=False)
     build = get_build(build_id)
     if build['state'] != st_canceled:
         return False
@@ -6043,7 +5950,7 @@ def get_build_notifications(user_id):
     FROM build_notifications
     WHERE user_id = %%(user_id)i
     """ % ', '.join(fields)
-    return _multiRow(query, locals(), fields)
+    return db.multiRow(query, locals(), fields)
 
 def new_group(name):
     """Add a user group to the database"""
@@ -6101,7 +6008,7 @@ def get_group_members(group):
     q = """SELECT %s FROM user_groups
     JOIN users ON user_id = users.id
     WHERE active = TRUE AND group_id = %%(group_id)i""" % ','.join(fields)
-    return _multiRow(q, locals(), fields)
+    return db.multiRow(q, locals(), fields)
 
 def set_user_status(user, status):
     context.session.assertPerm('admin')
@@ -6112,7 +6019,7 @@ def set_user_status(user, status):
         return
     update = """UPDATE users SET status = %(status)i WHERE id = %(user_id)i"""
     user_id = user['id']
-    rows = _dml(update, locals())
+    rows = db.dml(update, locals(), commit=False)
     # sanity check
     if rows == 0:
         raise koji.GenericError, 'invalid user ID: %i' % user_id
@@ -6128,7 +6035,7 @@ def get_event():
     """
     if hasattr(context, 'event_id'):
         return context.event_id
-    event_id = _singleValue("SELECT get_event()")
+    event_id = db.singleValue("SELECT get_event()")
     context.event_id = event_id
     return event_id
 
@@ -6189,7 +6096,7 @@ class InsertProcessor(object):
         self.data['creator_id'] = user_id
 
     def execute(self):
-        return _dml(str(self), self.data)
+        return db.dml(str(self), self.data, commit=False)
 
 
 class UpdateProcessor(object):
@@ -6263,7 +6170,7 @@ class UpdateProcessor(object):
         self.clauses.append('active = TRUE')
 
     def execute(self):
-        return _dml(str(self), self.get_values())
+        return db.dml(str(self), self.get_values(), commit=False)
 
 
 class QueryProcessor(object):
@@ -6416,16 +6323,16 @@ SELECT %(col_str)s
             return ''
 
     def singleValue(self, strict=True):
-        return _singleValue(str(self), self.values, strict=strict)
+        return db.singleValue(str(self), self.values, strict=strict)
 
     def execute(self):
         query = str(self)
         if self.opts.get('countOnly'):
-            return _singleValue(query, self.values, strict=True)
+            return db.singleValue(query, self.values, strict=True)
         elif self.opts.get('asList'):
-            return _fetchMulti(query, self.values)
+            return db.fetchMulti(query, self.values)
         else:
-            return _multiRow(query, self.values, (self.aliases or self.columns))
+            return db.multiRow(query, self.values, (self.aliases or self.columns))
 
 
     def iterate(self):
@@ -6453,9 +6360,9 @@ SELECT %(col_str)s
         query = "FETCH %i FROM %s" % (chunksize, cname)
         while True:
             if as_list:
-                buf = _fetchMulti(query, {})
+                buf = db.fetchMulti(query, {})
             else:
-                buf = _multiRow(query, {}, fields)
+                buf = db.multiRow(query, {}, fields)
             if not buf:
                 break
             for row in buf:
@@ -6989,7 +6896,7 @@ def importImageInternal(task_id, build_id, imgdata):
             continue
         sys.stderr.write('associating installed rpms with %s' % archive['id'])
         for rpm_id in rpm_ids:
-            _dml(q, {'image_id': archive['id'], 'rpm_id': rpm_id})
+            db.dml(q, {'image_id': archive['id'], 'rpm_id': rpm_id}, commit=False)
 
     koji.plugin.run_callbacks('postImport', type='image', image=imgdata,
                               fullpath=fullpath)
@@ -7310,7 +7217,7 @@ class RootExports(object):
         values = {'id': id}
         q = """SELECT id, EXTRACT(EPOCH FROM time) FROM events
                 WHERE id = %(id)i"""
-        return _singleRow(q, values, fields, strict=True)
+        return db.singleRow(q, values, fields, strict=True)
 
     def getLastEvent(self, before=None):
         """
@@ -7340,7 +7247,7 @@ class RootExports(object):
             q += """ WHERE EXTRACT(EPOCH FROM time) < %(before)r"""
             values['before'] = before
         q += """ ORDER BY id DESC LIMIT 1"""
-        return _singleRow(q, values, fields, strict=True)
+        return db.singleRow(q, values, fields, strict=True)
 
     def makeTask(self,*args,**opts):
         #this is mainly for debugging
@@ -8187,7 +8094,7 @@ class RootExports(object):
                        AND build.state = %(st_complete)i
                        AND build.task_id IS NOT NULL"""
 
-        return _singleValue(query, locals())
+        return db.singleValue(query, locals())
 
     packageListAdd = staticmethod(pkglist_add)
     packageListRemove = staticmethod(pkglist_remove)
@@ -8443,13 +8350,8 @@ class RootExports(object):
     getTag = staticmethod(get_tag)
 
     def getPackageID(self,name):
-        c=context.cnx.cursor()
         q="""SELECT id FROM package WHERE name=%(name)s"""
-        c.execute(q,locals())
-        r=c.fetchone()
-        if not r:
-            return None
-        return r[0]
+        return db.singleValue(q, locals(), strict=False)
 
     getPackage = staticmethod(lookup_package)
 
@@ -8476,7 +8378,7 @@ class RootExports(object):
         """
         if tagID is None and userID is None and pkgID is None:
             query = """SELECT id, name from package"""
-            results = _multiRow(query,{},('package_id', 'package_name'))
+            results = db.multiRow(query,{},('package_id', 'package_name'))
         else:
             if tagID is not None:
                 tagID = get_tag_id(tagID,strict=True)
@@ -8882,6 +8784,12 @@ class RootExports(object):
             ('build.version','build_version'),
             ('build.release','build_release'),
         )
+        field_names = []
+        field_alias = []
+        for field, alias in fields:
+            field_names.append(field)
+            field_alias.append(alias)
+
         q = """SELECT %s FROM task
         JOIN channels ON task.channel_id = channels.id
         JOIN users ON task.owner = users.id
@@ -8890,16 +8798,14 @@ class RootExports(object):
         LEFT OUTER JOIN package ON build.pkg_id = package.id
         WHERE (task.state NOT IN (%%(CLOSED)d,%%(CANCELED)d,%%(FAILED)d)
             OR NOW() - task.create_time < '1 hour'::interval)
-            """ % ','.join([f[0] for f in fields])
+            """ % ','.join(field_names)
         if owner:
             q += """AND users.id = %s
             """ % get_user(owner, strict=True)['id']
         q += """ORDER BY priority,create_time
         """
         #XXX hard-coded interval
-        c = context.cnx.cursor()
-        c.execute(q,koji.TASK_STATES)
-        return [dict(zip([f[1] for f in fields],row)) for row in c.fetchall()]
+        return db.multiRow(q, koji.TASK_STATES, field_alias)
 
     def resubmitTask(self, taskID):
         """Retry a canceled or failed task, using the same parameter as the original task.
@@ -8924,24 +8830,25 @@ class RootExports(object):
         if get_host(hostname):
             raise koji.GenericError, 'host already exists: %s' % hostname
         q = """SELECT id FROM channels WHERE name = 'default'"""
-        default_channel = _singleValue(q)
+        default_channel = db.singleValue(q)
         if krb_principal is None:
             fmt = context.opts.get('HostPrincipalFormat')
             if fmt:
                 krb_principal = fmt % hostname
         #users entry
-        userID = context.session.createUser(hostname, usertype=koji.USERTYPES['HOST'],
+        userID = context.session.createUser(hostname,
+                                            usertype=koji.USERTYPES['HOST'],
                                             krb_principal=krb_principal)
         #host entry
-        hostID = _singleValue("SELECT nextval('host_id_seq')", strict=True)
+        hostID = db.get_sequence_nextval('host_id_seq')
         arches = " ".join(arches)
         insert = """INSERT INTO host (id, user_id, name, arches)
         VALUES (%(hostID)i, %(userID)i, %(hostname)s, %(arches)s)"""
-        _dml(insert, locals())
+        db.dml(insert, locals(), commit=False)
         #host_channels entry
         insert = """INSERT INTO host_channels (host_id, channel_id)
         VALUES (%(hostID)i, %(default_channel)i)"""
-        _dml(insert, locals())
+        db.dml(insert, locals(), commit=False)
         return hostID
 
     def enableHost(self, hostname):
@@ -9010,7 +8917,7 @@ class RootExports(object):
         ORDER BY update_time DESC
         LIMIT 1
         """
-        return _singleValue(query, locals(), strict=False)
+        return db.singleValue(query, locals(), strict=False)
 
     getAllArches = staticmethod(get_all_arches)
 
@@ -9049,7 +8956,7 @@ class RootExports(object):
         query = """SELECT id, name FROM permissions
         ORDER BY id"""
 
-        return _multiRow(query, {}, ['id', 'name'])
+        return db.multiRow(query, {}, ['id', 'name'])
 
     def getLoggedInUser(self):
         """Return information about the currently logged-in user.  Returns data
@@ -9072,7 +8979,7 @@ class RootExports(object):
         buildid = buildinfo['id']
         koji.plugin.run_callbacks('preBuildStateChange', attribute='owner_id', old=buildinfo['owner_id'], new=userid, info=buildinfo)
         q = """UPDATE build SET owner=%(userid)i WHERE id=%(buildid)i"""
-        _dml(q,locals())
+        db.dml(q,locals(), commit=False)
         koji.plugin.run_callbacks('postBuildStateChange', attribute='owner_id', old=buildinfo['owner_id'], new=userid, info=buildinfo)
 
     def setBuildTimestamp(self, build, ts):
@@ -9099,7 +9006,7 @@ class RootExports(object):
         q = """UPDATE build
         SET completion_time=TIMESTAMP 'epoch' AT TIME ZONE 'utc' + '%(ts)f seconds'::interval
         WHERE id=%%(buildid)i""" % locals()
-        _dml(q,locals())
+        db.dml(q,locals(), commit=False)
         koji.plugin.run_callbacks('postBuildStateChange', attribute='completion_ts', old=buildinfo['completion_ts'], new=ts, info=buildinfo)
 
     def count(self, methodName, *args, **kw):
@@ -9188,7 +9095,7 @@ class RootExports(object):
         FROM build_notifications
         WHERE id = %%(id)i
         """ % ', '.join(fields)
-        return _singleRow(query, locals(), fields)
+        return db.singleRow(query, locals(), fields)
 
     def updateNotification(self, id, package_id, tag_id, success_only):
         """Update an existing build notification with new data.  If the notification
@@ -9213,7 +9120,7 @@ class RootExports(object):
         WHERE id = %(id)i
         """
 
-        _dml(update, locals())
+        db.dml(update, locals(), commit=False)
 
     def createNotification(self, user_id, package_id, tag_id, success_only):
         """Create a new notification.  If the user_id does not match the currently logged-in user
@@ -9236,7 +9143,7 @@ class RootExports(object):
         VALUES
         (%(user_id)i, %(package_id)s, %(tag_id)s, %(success_only)s, %(email)s)
         """
-        _dml(insert, locals())
+        db.dml(insert, locals(), commit=False)
 
     def deleteNotification(self, id):
         """Delete the notification with the given ID.  If the currently logged-in
@@ -9253,7 +9160,7 @@ class RootExports(object):
             raise koji.GenericError, 'user %i cannot delete notifications for user %i' % \
                   (currentUser['id'], notification['user_id'])
         delete = """DELETE FROM build_notifications WHERE id = %(id)i"""
-        _dml(delete, locals())
+        db.dml(delete, locals(), commit=False)
 
     def _prepareSearchTerms(self, terms, matchType):
         """Process the search terms before passing them to the database.
@@ -9354,7 +9261,7 @@ class BuildRoot(object):
         fields = ('id', 'host_id', 'repo_id', 'arch', 'task_id',
                     'create_event', 'retire_event', 'state')
         q = """SELECT %s FROM buildroot WHERE id=%%(id)i""" % (",".join(fields))
-        data = _singleRow(q,locals(),fields,strict=False)
+        data = db.singleRow(q,locals(),fields,strict=False)
         if data == None:
             raise koji.GenericError, 'no buildroot with ID: %i' % id
         self.id = id
@@ -9362,10 +9269,10 @@ class BuildRoot(object):
 
     def new(self, host, repo, arch, task_id=None):
         state = koji.BR_STATES['INIT']
-        id = _singleValue("SELECT nextval('buildroot_id_seq')", strict=True)
+        id = db.get_sequence_nextval('buildroot_id_seq')
         q = """INSERT INTO buildroot(id,host_id,repo_id,arch,state,task_id)
         VALUES (%(id)i,%(host)i,%(repo)i,%(arch)s,%(state)i,%(task_id)s)"""
-        _dml(q,locals())
+        db.dml(q,locals(), commit=False)
         self.load(id)
         return self.id
 
@@ -9400,7 +9307,7 @@ class BuildRoot(object):
             #we do not re-init buildroots
             raise koji.GenericError, "Cannot change buildroot state to INIT"
         q = """SELECT state,retire_event FROM buildroot WHERE id=%(id)s FOR UPDATE"""
-        lstate,retire_event = _fetchSingle(q,locals(),strict=True)
+        lstate,retire_event = db.fetchSingle(q,locals(),strict=True)
         if koji.BR_STATES[lstate] == 'EXPIRED':
             #we will quietly ignore a request to expire an expired buildroot
             #otherwise this is an error
@@ -9412,7 +9319,7 @@ class BuildRoot(object):
         if koji.BR_STATES[state] == 'EXPIRED':
             set += ",retire_event=get_event()"
         update = """UPDATE buildroot SET %s WHERE id=%%(id)s""" % set
-        _dml(update,locals())
+        db.dml(update,locals(), commit=False)
         self.data['state'] = state
 
     def getList(self):
@@ -9463,7 +9370,7 @@ class BuildRoot(object):
         #we sort to try to avoid deadlock issues
         rpm_ids.sort()
         for rpm_id in rpm_ids:
-            _dml(q, locals())
+            db.dml(q, locals(), commit=False)
 
     def setList(self,rpmlist):
         """Set the initial list of rpms in a buildroot"""
@@ -9515,7 +9422,7 @@ class BuildRoot(object):
         (%(broot_id)i, %(archive_id)i, %(project)s)"""
         broot_id = self.id
         for archive_id in sorted(new_archives):
-            _dml(insert, locals())
+            db.dml(insert, locals(), commit=False)
 
 class Host(object):
 
@@ -9536,33 +9443,31 @@ class Host(object):
             raise koji.AuthError, "This method requires an exclusive session"
         return True
 
-    def taskUnwait(self,parent):
+    def taskUnwait(self, parent):
         """Clear wait data for task"""
-        c = context.cnx.cursor()
+        values = {'parent': parent}
         #unwait the task
         q = """UPDATE task SET waiting='false' WHERE id = %(parent)s"""
-        context.commit_pending = True
-        c.execute(q,locals())
+        db.dml(q, values, commit=False)
         #...and un-await its subtasks
         q = """UPDATE task SET awaited='false' WHERE parent=%(parent)s"""
-        c.execute(q,locals())
+        db.dml(q, values, commit=False)
 
     def taskSetWait(self,parent,tasks):
         """Mark task waiting and subtasks awaited"""
         self.taskUnwait(parent)
-        c = context.cnx.cursor()
+        values = {'parent': parent}
         #mark tasks awaited
         q = """UPDATE task SET waiting='true' WHERE id=%(parent)s"""
-        context.commit_pending = True
-        c.execute(q,locals())
+        db.dml(q, values, commit=False)
         if tasks is None:
             #wait on all subtasks
             q = """UPDATE task SET awaited='true' WHERE parent=%(parent)s"""
-            c.execute(q,locals())
+            db.dml(q, values, commit=False)
         else:
             for id in tasks:
                 q = """UPDATE task SET awaited='true' WHERE id=%(id)s"""
-                c.execute(q,locals())
+                db.dml(q, {'id': id}, commit=False)
 
     def taskWaitCheck(self,parent):
         """Return status of awaited subtask
@@ -9570,19 +9475,17 @@ class Host(object):
         The return value is [finished, unfinished] where each entry
         is a list of task ids."""
         #check to see if any of the tasks have finished
-        c = context.cnx.cursor()
         q = """
         SELECT id,state FROM task
         WHERE parent=%(parent)s AND awaited = TRUE
         FOR UPDATE"""
-        c.execute(q,locals())
-        canceled = koji.TASK_STATES['CANCELED']
-        closed = koji.TASK_STATES['CLOSED']
-        failed = koji.TASK_STATES['FAILED']
+        finish_state = (koji.TASK_STATES['CANCELED'],
+                        koji.TASK_STATES['CLOSED'],
+                        koji.TASK_STATES['FAILED'])
         finished = []
         unfinished = []
-        for id,state in c.fetchall():
-            if state in (canceled,closed,failed):
+        for id,state in db.fetchMulti(q, locals()):
+            if state in finish_state:
                 finished.append(id)
             else:
                 unfinished.append(id)
@@ -9593,18 +9496,15 @@ class Host(object):
         finished, unfinished = self.taskWaitCheck(parent)
         # un-await finished tasks
         if finished:
-            context.commit_pending = True
             for id in finished:
-                c = context.cnx.cursor()
                 q = """UPDATE task SET awaited='false' WHERE id=%(id)s"""
-                c.execute(q,locals())
+                db.dml(q, {'id': id}, commit=False)
         return [finished,unfinished]
 
     def taskWaitResults(self,parent,tasks):
         results = {}
         #if we're getting results, we're done waiting
         self.taskUnwait(parent)
-        c = context.cnx.cursor()
         canceled = koji.TASK_STATES['CANCELED']
         closed = koji.TASK_STATES['CLOSED']
         failed = koji.TASK_STATES['FAILED']
@@ -9614,8 +9514,7 @@ class Host(object):
         if tasks is None:
             #query all subtasks
             tasks = []
-            c.execute(q,locals())
-            for id,state in c.fetchall():
+            for id,state in db.fetchMulti(q, locals()):
                 if state == canceled:
                     raise koji.GenericError, "Subtask canceled"
                 elif state in (closed,failed):
@@ -9629,7 +9528,6 @@ class Host(object):
 
     def getHostTasks(self):
         """get status of open tasks assigned to host"""
-        c = context.cnx.cursor()
         host_id = self.id
         #query tasks
         fields = ['id','waiting','weight']
@@ -9638,8 +9536,7 @@ class Host(object):
         SELECT %s FROM task
         WHERE host_id = %%(host_id)s AND state = %%(st_open)s
         """  % (",".join(fields))
-        c.execute(q,locals())
-        tasks = [ dict(zip(fields,x)) for x in c.fetchall() ]
+        tasks = db.multiRow(q, locals(), fields)
         for task in tasks:
             id = task['id']
             if task['waiting']:
@@ -9651,11 +9548,9 @@ class Host(object):
     def updateHost(self,task_load,ready):
         host_data = get_host(self.id)
         if task_load != host_data['task_load'] or ready != host_data['ready']:
-            c = context.cnx.cursor()
             id = self.id
             q = """UPDATE host SET task_load=%(task_load)s,ready=%(ready)s WHERE id=%(id)s"""
-            c.execute(q,locals())
-            context.commit_pending = True
+            db.dml(q, locals(), commit=False)
 
     def getLoadData(self):
         """Get load balancing data
@@ -9675,19 +9570,18 @@ class Host(object):
 
     def getTask(self):
         """Open next available task and return it"""
-        c = context.cnx.cursor()
         id = self.id
         #get arch and channel info for host
         q = """
         SELECT arches FROM host WHERE id = %(id)s
         """
-        c.execute(q,locals())
-        arches = c.fetchone()[0].split()
+        # FIXME: is it possible that arches is None? If yes, should return
+        # None?
+        arches = db.fetchSingle(q, locals())[0].split()
         q = """
         SELECT channel_id FROM host_channels WHERE host_id = %(id)s
         """
-        c.execute(q,locals())
-        channels = [ x[0] for x in c.fetchall() ]
+        channels = [ x[0] for x in db.fetchMulti(q, locals()) ]
 
         #query tasks
         fields = ['id', 'state', 'method', 'request', 'channel_id', 'arch', 'parent']
@@ -9699,9 +9593,7 @@ class Host(object):
             OR (state = %%(st_assigned)s AND host_id = %%(id)s)
         ORDER BY priority,create_time
         """  % (",".join(fields))
-        c.execute(q,locals())
-        for data in c.fetchall():
-            data = dict(zip(fields,data))
+        for data in db.multiRow(q, locals(), fields):
             # XXX - we should do some pruning here, but for now...
             # check arch
             if data['arch'] not in arches:
@@ -9722,7 +9614,7 @@ class Host(object):
     def isEnabled(self):
         """Return whether this host is enabled or not."""
         query = """SELECT enabled FROM host WHERE id = %(id)i"""
-        return _singleValue(query, {'id': self.id}, strict=True)
+        return db.singleValue(query, {'id': self.id}, strict=True)
 
 class HostExports(object):
     '''Contains functions that are made available via XMLRPC'''
@@ -9823,7 +9715,7 @@ class HostExports(object):
             # first check for existing task with this parent/label
             q = """SELECT id FROM task
             WHERE parent=%(parent)s AND label=%(label)s"""
-            row = _fetchSingle(q,opts)
+            row = db.fetchSingle(q,opts)
             if row:
                 #return task id
                 return row[0]
@@ -10268,7 +10160,7 @@ class HostExports(object):
         FROM build
         WHERE id = %(build_id)i
         FOR UPDATE"""
-        result = _singleRow(query, locals(), ('state', 'completion_time'))
+        result = db.singleRow(query, locals(), ('state', 'completion_time'))
 
         if result['state'] != koji.BUILD_STATES['BUILDING']:
             raise koji.GenericError, 'cannot update build %i, state: %s' % \
@@ -10281,7 +10173,7 @@ class HostExports(object):
         SET state = %(st_failed)i,
         completion_time = NOW()
         WHERE id = %(build_id)i"""
-        _dml(update, locals())
+        db.dml(update, locals(), commit=False)
         build_notification(task_id, build_id)
         koji.plugin.run_callbacks('postBuildStateChange', attribute='state', old=buildinfo['state'], new=st_failed, info=buildinfo)
 

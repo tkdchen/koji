@@ -34,6 +34,8 @@ except ImportError:
 assert pgdb.threadsafety >= 1
 import context
 
+import koji
+
 ## Globals ##
 _DBopts = None
 # A persistent connection to the database.
@@ -45,6 +47,9 @@ _DBopts = None
 # since Apache is not using threading,
 # but play it safe anyway.
 _DBconn = context.ThreadLocal()
+
+logger = logging.getLogger('koji.db')
+
 
 class DBWrapper:
     def __init__(self, cnx):
@@ -74,7 +79,7 @@ class DBWrapper:
 class CursorWrapper:
     def __init__(self, cursor):
         self.cursor = cursor
-        self.logger = logging.getLogger('koji.db')
+        self.logger = logger
 
     def __getattr__(self, key):
         return getattr(self.cursor, key)
@@ -133,7 +138,6 @@ def getDBopts():
     return _DBopts
 
 def connect():
-    logger = logging.getLogger('koji.db')
     global _DBconn
     if hasattr(_DBconn, 'conn'):
         # Make sure the previous transaction has been
@@ -165,6 +169,126 @@ def connect():
     _DBconn.conn = conn
 
     return DBWrapper(conn)
+
+
+def commit_on_success(func):
+    """Ensure transaction is committed after function succeeds to run"""
+    def _func(*args, **kwargs):
+        cnx = context.context.cnx
+        try:
+            result = func(*args, **kwargs)
+        except:
+            cnx.rollback()
+            raise
+        else:
+            cnx.commit()
+        return result
+    return _func
+
+
+### Database query interfaces ###
+
+
+def fetchMulti(query, values):
+    """Run the query and return all rows"""
+    cnx = context.context.cnx
+    c = cnx.cursor()
+    try:
+        if values is None:
+            c.execute(query)
+        else:
+            c.execute(query, values)
+        return c.fetchall()
+    finally:
+        c.close()
+
+
+def fetchSingle(query, values, strict=False):
+    """Run the query and return a single row
+
+    If strict is true, raise an error if the query returns more or less than
+    one row.
+    """
+    results = fetchMulti(query, values)
+    numRows = len(results)
+    if numRows == 0:
+        if strict:
+            raise koji.GenericError, 'query returned no rows'
+        else:
+            return None
+    elif strict and numRows > 1:
+        raise koji.GenericError, \
+            'multiple rows returned for a single row query'
+    else:
+        return results[0]
+
+
+def multiRow(query, values, fields):
+    """Return all rows from "query".  Named query parameters
+    can be specified using the "values" map.  Results will be returned
+    as a list of maps.  Each map in the list will have a key for each
+    element in the "fields" list.  If there are no results, an empty
+    list will be returned."""
+    return [dict(zip(fields, row)) for row in fetchMulti(query, values)]
+
+
+def singleRow(query, values, fields, strict=False):
+    """Return a single row from "query".  Named parameters can be
+    specified using the "values" map.  The result will be returned as
+    as map.  The map will have a key for each element in the "fields"
+    list.  If more than one row is returned and "strict" is true, a
+    GenericError will be raised.  If no rows are returned, and "strict"
+    is True, a GenericError will be raised.  Otherwise None will be
+    returned."""
+    row = fetchSingle(query, values, strict)
+    if row:
+        return dict(zip(fields, row))
+    else:
+        #strict enforced by fetchSingle
+        return None
+
+
+def singleValue(query, values=None, strict=True):
+    """Perform a query that returns a single value.
+
+    Note that unless strict is True a return value of None could mean either
+    a single NULL value or zero rows returned.
+    """
+    if values is None:
+        values = {}
+    row = fetchSingle(query, values, strict)
+    if row:
+        return row[0]
+    else:
+        # don't need to check strict here, since that was already handled by singleRow()
+        return None
+
+
+def dml(operation, values, commit=True):
+    """Run an insert, update, or delete. Return number of rows affected"""
+    ctx = context.context
+    c = ctx.cnx.cursor()
+    try:
+        c.execute(operation, values)
+        ret = c.rowcount
+        logger.debug("Operation affected %s row(s)", ret)
+    finally:
+        c.close()
+    if commit:
+        ctx.cnx.commit()
+        ctx.commit_pending = False
+    else:
+        ctx.commit_pending = True
+    return ret
+
+
+### Some high level APIs ###
+
+
+def get_sequence_nextval(sequence, strict=True):
+    query = 'SELECT nextval(%(sequence)s)'
+    return singleValue(query, {'sequence': sequence}, strict=True)
+
 
 if __name__ == "__main__":
     setDBopts( database = "test", user = "test")

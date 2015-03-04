@@ -1382,10 +1382,6 @@ name=build
 
     return ''.join(parts)
 
-def get_sequence_value(cursor, sequence):
-    cursor.execute("""SELECT nextval(%(sequence)s)""", locals())
-    return cursor.fetchone()[0]
-
 # From Python Cookbook 2nd Edition, Recipe 8.6
 def format_exc_plus():
     """ Format the usual traceback information, followed by a listing of

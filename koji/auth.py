@@ -27,6 +27,7 @@ import krbV
 import koji
 import cgi      #for parse_qs
 from context import context
+from koji import db
 
 # 1 - load session if provided
 #       - check uri for session id
@@ -86,7 +87,6 @@ class Session(object):
         except:
             callnum = None
         #lookup the session
-        c = context.cnx.cursor()
         fields = {
             'authtype': 'authtype',
             'callnum': 'callnum',
@@ -107,11 +107,9 @@ class Session(object):
         AND hostip = %%(hostip)s
         FOR UPDATE
         """ % ",".join(fields)
-        c.execute(q,locals())
-        row = c.fetchone()
-        if not row:
+        session_data = db.singleRow(q, locals(), fields)
+        if not session_data:
             raise koji.AuthError, 'Invalid session or bad credentials'
-        session_data = dict(zip(aliases, row))
         #check for expiration
         if session_data['expired']:
             raise koji.AuthExpired, 'session "%i" has expired' % id
@@ -146,13 +144,11 @@ class Session(object):
         # we used to get a row lock here as an attempt to maintain sanity of exclusive
         # sessions, but it was an imperfect approach and the lock could cause some
         # performance issues.
-        fields = ('name','status','usertype')
-        q = """SELECT %s FROM users WHERE id=%%(user_id)s""" % ','.join(fields)
-        c.execute(q,session_data)
-        user_data = dict(zip(fields,c.fetchone()))
+        user_data = get_user_data(session_data['user_id'])
 
         if user_data['status'] != koji.USER_STATUS['NORMAL']:
             raise koji.AuthError, 'logins by %s are not allowed' % user_data['name']
+
         #check for exclusive sessions
         if session_data['exclusive']:
             #we are the exclusive session for this user
@@ -162,8 +158,7 @@ class Session(object):
             q = """SELECT id FROM sessions WHERE user_id=%(user_id)s
             AND "exclusive" = TRUE AND expired = FALSE"""
             #should not return multiple rows (unique constraint)
-            c.execute(q,session_data)
-            row = c.fetchone()
+            row = db.fetchSingle(q, session_data)
             if row:
                 (excl_id,) = row
                 if excl_id == session_data['master']:
@@ -179,15 +174,13 @@ class Session(object):
 
         # update timestamp
         q = """UPDATE sessions SET update_time=NOW() WHERE id = %(id)i"""
-        c.execute(q,locals())
-        #save update time
-        context.cnx.commit()
+        db.dml(q, locals())
 
         #update callnum (this is deliberately after the commit)
         #see earlier note near RetryError
         if callnum is not None:
             q = """UPDATE sessions SET callnum=%(callnum)i WHERE id = %(id)i"""
-            c.execute(q,locals())
+            db.dml(q, locals(), commit=False)
 
         # record the login data
         self.id = id
@@ -240,14 +233,12 @@ class Session(object):
 
     def checkLoginAllowed(self, user_id):
         """Verify that the user is allowed to login"""
-        cursor = context.cnx.cursor()
         query = """SELECT name, usertype, status FROM users WHERE id = %(user_id)i"""
-        cursor.execute(query, locals())
-        result = cursor.fetchone()
+        result = db.fetchSingle(query, locals())
         if not result:
             raise koji.AuthError, 'invalid user_id: %s' % user_id
         name, usertype, status = result
-        
+
         if status != koji.USER_STATUS['NORMAL']:
             raise koji.AuthError, 'logins by %s are not allowed' % name
 
@@ -267,14 +258,10 @@ class Session(object):
                 hostip = socket.gethostbyname(socket.gethostname())
 
         # check passwd
-        c = context.cnx.cursor()
-        q = """SELECT id FROM users
-        WHERE name = %(user)s AND password = %(password)s"""
-        c.execute(q,locals())
-        r = c.fetchone()
-        if not r:
+        user = get_user_by_credential(user, password)
+        if not user:
             raise koji.AuthError, 'invalid username or password'
-        user_id = r[0]
+        user_id = user['id']
 
         self.checkLoginAllowed(user_id)
 
@@ -394,12 +381,9 @@ class Session(object):
                 raise koji.AuthError, '%s is not authorized to login other users' % client_dn
         else:
             username = client_name
-        
-        cursor = context.cnx.cursor()
-        query = """SELECT id FROM users
-        WHERE name = %(username)s"""
-        cursor.execute(query, locals())
-        result = cursor.fetchone()
+
+        query = """SELECT id FROM users WHERE name = %(username)s"""
+        result = db.fetchSingle(query, {'username': username})
         if result:
             user_id = result[0]
         else:
@@ -418,9 +402,9 @@ class Session(object):
         sinfo = self.createSession(user_id, hostip, koji.AUTHTYPE_SSL)
         return sinfo
 
+    @db.commit_on_success
     def makeExclusive(self,force=False):
         """Make this session exclusive"""
-        c = context.cnx.cursor()
         if self.master is not None:
             raise koji.GenericError, "subsessions cannot become exclusive"
         if self.exclusive:
@@ -428,35 +412,31 @@ class Session(object):
             raise koji.GenericError, "session is already exclusive"
         user_id = self.user_id
         session_id = self.id
+        values = {'user_id': user_id}
         #acquire a row lock on the user entry
         q = """SELECT id FROM users WHERE id=%(user_id)s FOR UPDATE"""
-        c.execute(q,locals())
+        db.fetchMulti(q, values)
         # check that no other sessions for this user are exclusive
         q = """SELECT id FROM sessions WHERE user_id=%(user_id)s
         AND expired = FALSE AND "exclusive" = TRUE
         FOR UPDATE"""
-        c.execute(q,locals())
-        row = c.fetchone()
+        row = db.fetchSingle(q, values)
         if row:
             if force:
                 #expire the previous exclusive session and try again
                 (excl_id,) = row
                 q = """UPDATE sessions SET expired=TRUE,"exclusive"=NULL WHERE id=%(excl_id)s"""
-                c.execute(q,locals())
+                db.dml(q, {'excl_id': excl_id})
             else:
                 raise koji.AuthLockError, "Cannot get exclusive session"
         #mark this session exclusive
         q = """UPDATE sessions SET "exclusive"=TRUE WHERE id=%(session_id)s"""
-        c.execute(q,locals())
-        context.cnx.commit()
+        db.dml(q, {'session_id': session_id}, commit=False)
 
     def makeShared(self):
         """Drop out of exclusive mode"""
-        c = context.cnx.cursor()
-        session_id = self.id
-        q = """UPDATE sessions SET "exclusive"=NULL WHERE id=%(session_id)s"""
-        c.execute(q,locals())
-        context.cnx.commit()
+        q = 'UPDATE sessions SET "exclusive"=NULL WHERE id=%(session_id)s'
+        db.dml(q, {'session_id': self.id})
 
     def logout(self):
         """expire a login session"""
@@ -464,12 +444,10 @@ class Session(object):
             #XXX raise an error?
             raise koji.AuthError, "Not logged in"
         update = """UPDATE sessions
-        SET expired=TRUE,exclusive=NULL
+        SET expired=TRUE, "exclusive"=NULL
         WHERE id = %(id)i OR master = %(id)i"""
         #note we expire subsessions as well
-        c = context.cnx.cursor()
-        c.execute(update, {'id': self.id})
-        context.cnx.commit()
+        db.dml(update, {'id': self.id})
         self.logged_in = False
 
     def logoutChild(self, session_id):
@@ -478,12 +456,10 @@ class Session(object):
             #XXX raise an error?
             raise koji.AuthError, "Not logged in"
         update = """UPDATE sessions
-        SET expired=TRUE,exclusive=NULL
+        SET expired=TRUE, "exclusive"=NULL
         WHERE id = %(session_id)i AND master = %(master)i"""
         master = self.id
-        c = context.cnx.cursor()
-        c.execute(update, locals())
-        context.cnx.commit()
+        db.dml(update, locals())
 
     def createSession(self, user_id, hostip, authtype, master=None):
         """Create a new session for the given user.
@@ -491,8 +467,6 @@ class Session(object):
         Return a map containing the session-id and session-key.
         If master is specified, create a subsession
         """
-        c = context.cnx.cursor()
-
         # generate a random key
         alnum = string.ascii_letters + string.digits
         key = "%s-%s" %(user_id,
@@ -500,17 +474,14 @@ class Session(object):
         # use sha? sha.new(phrase).hexdigest()
 
         # get a session id
-        q = """SELECT nextval('sessions_id_seq')"""
-        c.execute(q, {})
-        (session_id,) = c.fetchone()
+        session_id = db.get_sequence_nextval('sessions_id_seq')
 
         #add session id to database
         q = """
         INSERT INTO sessions (id, user_id, key, hostip, authtype, master)
         VALUES (%(session_id)i, %(user_id)i, %(key)s, %(hostip)s, %(authtype)i, %(master)s)
         """
-        c.execute(q,locals())
-        context.cnx.commit()
+        db.dml(q, locals())
 
         #return session info
         return {'session-id' : session_id, 'session-key' : key}
@@ -562,32 +533,19 @@ class Session(object):
         '''Using session data, find host id (if there is one)'''
         if self.user_id is None:
             return None
-        c=context.cnx.cursor()
-        q="""SELECT id FROM host WHERE user_id = %(uid)d"""
-        c.execute(q,{'uid' : self.user_id })
-        r=c.fetchone()
-        c.close()
-        if r:
-            return r[0]
-        else:
-            return None
+        q = """SELECT id FROM host WHERE user_id = %(uid)d"""
+        return db.singleValue(q, {'uid': self.user_id}, strict=False)
 
     def getHostId(self):
         #for compatibility
         return self.host_id
 
+    # TODO: can this move to the lookup_name method?
     def getUserIdFromKerberos(self, krb_principal):
         """Return the user ID associated with a particular Kerberos principal.
         If no user with the given princpal if found, return None."""
-        c = context.cnx.cursor()
         q = """SELECT id FROM users WHERE krb_principal = %(krb_principal)s"""
-        c.execute(q,locals())
-        r = c.fetchone()
-        c.close()
-        if r:
-            return r[0]
-        else:
-            return None
+        return db.singleValue(q, locals(), strict=False)
 
     def createUser(self, name, usertype=None, status=None, krb_principal=None):
         """
@@ -607,15 +565,12 @@ class Session(object):
         elif not koji.USER_STATUS.get(status):
             raise koji.GenericError, 'invalid status: %s' % status
         
-        cursor = context.cnx.cursor()
-        select = """SELECT nextval('users_id_seq')"""
-        cursor.execute(select, locals())
-        user_id = cursor.fetchone()[0]
+        user_id = db.get_sequence_nextval('users_id_seq')
 
         insert = """INSERT INTO users (id, name, usertype, status, krb_principal)
         VALUES (%(user_id)i, %(name)s, %(usertype)i, %(status)i, %(krb_principal)s)"""
-        cursor.execute(insert, locals())
-        context.cnx.commit()
+
+        db.dml(insert, locals())
 
         return user_id
 
@@ -623,9 +578,7 @@ class Session(object):
         usertype = koji.USERTYPES['NORMAL']
         status = koji.USER_STATUS['NORMAL']
         update = """UPDATE users SET krb_principal = %(krb_principal)s WHERE name = %(name)s AND usertype = %(usertype)i AND status = %(status)i RETURNING users.id"""
-        cursor = context.cnx.cursor()
-        cursor.execute(update, locals())
-        r = cursor.fetchall()
+        r = db.fetchMulti(update, locals())
         if len(r) != 1:
             context.cnx.rollback()
             raise koji.AuthError, 'could not automatically associate Kerberos Principal with existing user %s' % (name,)
@@ -643,11 +596,8 @@ class Session(object):
         user_name = krb_principal[:atidx]
 
         # check if user already exists
-        c = context.cnx.cursor()
-        q = """SELECT krb_principal FROM users
-        WHERE name = %(user_name)s"""
-        c.execute(q,locals())
-        r = c.fetchone()
+        q = "SELECT krb_principal FROM users WHERE name = %(user_name)s"
+        r = db.fetchSingle(q, locals())
         if not r:
             return self.createUser(user_name, krb_principal=krb_principal)
         else:
@@ -661,33 +611,32 @@ def get_user_groups(user_id):
 
     returns a dictionary where the keys are the group ids and the values
     are the group names"""
-    c = context.cnx.cursor()
     t_group = koji.USERTYPES['GROUP']
     q = """SELECT group_id,name
     FROM user_groups JOIN users ON group_id = users.id
     WHERE active = TRUE AND users.usertype=%(t_group)i
         AND user_id=%(user_id)i"""
-    c.execute(q,locals())
-    return dict(c.fetchall())
+    return dict(db.fetchMulti(q, locals()))
 
 def get_user_perms(user_id):
-    c = context.cnx.cursor()
     q = """SELECT name
     FROM user_perms JOIN permissions ON perm_id = permissions.id
     WHERE active = TRUE AND user_id=%(user_id)s"""
-    c.execute(q,locals())
     #return a list of permissions by name
-    return [row[0] for row in c.fetchall()]
+    return [row[0] for row in db.fetchMulti(q, locals())]
 
 def get_user_data(user_id):
-    c = context.cnx.cursor()
-    fields = ('name','status','usertype')
-    q = """SELECT %s FROM users WHERE id=%%(user_id)s""" % ','.join(fields)
-    c.execute(q,locals())
-    row = c.fetchone()
-    if not row:
-        return None
-    return dict(zip(fields,row))
+    fields = ('name', 'status', 'usertype')
+    q = """SELECT %s FROM users WHERE id=%%(user_id)s""" % ', '.join(fields)
+    return db.singleRow(q, {'user_id': user_id}, fields)
+
+
+def get_user_by_credential(name, password):
+    fields = ('id', 'name', 'status', 'usertype', 'krb_principal')
+    q = '''SELECT %s FROM users
+WHERE name = %%(name)s AND password = %%(password)s''' % ', '.join(fields)
+    return db.singleRow(q, locals(), fields)
+
 
 def login(*args,**opts):
     return context.session.login(*args,**opts)
